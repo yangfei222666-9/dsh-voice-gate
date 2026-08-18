@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="小九语音门">
+  <link rel="apple-touch-icon" href="whale-icon.png">
+<link rel="icon" type="image/png" href="whale-icon.png">
+<title>小九语音门</title>
+<style>
+  :root{ --bg:#0b1020; --card:#141b31; --line:#232c4a; --txt:#e8ecf8; --sub:#8b95b8;
+         --accent:#5aa7ff; --accent2:#7cd7ff; --ok:#3ddc97; --err:#ff6b81; --amber:#ffc46b; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{ margin:0; height:100%; background:var(--bg); color:var(--txt);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC",sans-serif; }
+  body{ display:flex; flex-direction:column; padding:16px; gap:12px; max-width:640px; margin:0 auto; }
+  header{ display:flex; align-items:center; gap:10px; padding:4px 2px; }
+  header .logo{ font-size:30px; }
+  header h1{ font-size:19px; margin:0; font-weight:700; }
+  header .status{ margin-left:auto; font-size:12px; padding:4px 10px; border-radius:999px;
+    background:var(--card); border:1px solid var(--line); color:var(--sub); }
+  header .status.on{ color:var(--ok); border-color:var(--ok); }
+  header .status.off{ color:var(--err); border-color:var(--err); }
+  #box{ flex:1; background:var(--card); border:1px solid var(--line); border-radius:18px;
+    padding:16px; overflow-y:auto; min-height:180px; }
+  #box .hint{ color:var(--sub); font-size:14px; line-height:1.7; }
+  #box #final{ font-size:19px; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+  #box #interim{ color:var(--sub); font-size:15px; font-style:italic; margin-top:6px; }
+  textarea{ display:block; width:100%; background:var(--bg); color:var(--txt); border:1px solid var(--line);
+    border-radius:14px; padding:12px; font-size:16px; min-height:74px; resize:none; }
+  .mic-wrap{ display:flex; justify-content:center; padding:6px 0 2px; }
+  #mic{ width:92px; height:92px; border-radius:50%; border:3px solid var(--accent);
+    background:radial-gradient(circle at 30% 25%, #1d2b52, #101730); color:var(--accent2);
+    font-size:38px; cursor:pointer; transition:all .15s ease; }
+  #mic.listening{ border-color:var(--err); background:radial-gradient(circle at 30% 25%, #4a1d2e, #24101c);
+    animation:pulse 1.2s infinite; }
+  #mic:disabled{ opacity:.45; }
+  @keyframes pulse{ 0%{ box-shadow:0 0 0 0 rgba(255,107,129,.45);} 70%{ box-shadow:0 0 0 22px rgba(255,107,129,0);} 100%{ box-shadow:0 0 0 0 rgba(255,107,129,0);} }
+  .mic-label{ text-align:center; color:var(--sub); font-size:12px; margin-top:6px; }
+  .btn-row{ display:flex; gap:10px; }
+  button.act{ flex:1; padding:14px 0; border:none; border-radius:14px; font-size:16px; font-weight:700; cursor:pointer; }
+  #send{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#081226; }
+  #send:disabled{ opacity:.45; }
+  #clear{ background:var(--card); color:var(--sub); border:1px solid var(--line); }
+  #msg{ display:none; padding:10px 14px; border-radius:12px; font-size:13px; line-height:1.6; }
+  #msg.ok{ display:block; background:rgba(61,220,151,.12); color:var(--ok); }
+  #msg.err{ display:block; background:rgba(255,107,129,.12); color:var(--err); }
+  footer{ text-align:center; font-size:11px; color:#4a5377; padding-bottom:6px; }
+  a{ color:var(--accent2); }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">🐳</span><h1>小九语音门</h1>
+  <span id="status" class="status">连接中…</span>
+</header>
+
+<div id="box">
+  <div class="hint" id="hint">点下方 🎤 按钮开始说话,说完自动转成文字;<br>满意就点「发给小九」,一条语音指令直达管家 🚀<br>长按会持续听,松手停止(部分机型只支持点按)。</div>
+  <div id="final"></div><div id="interim"></div>
+</div>
+
+<textarea id="edit" placeholder="也可以直接打字…"></textarea>
+
+<div class="mic-wrap"><button id="mic" aria-label="开始说话">🎤</button></div>
+<div class="mic-label" id="miclabel">点按:开始/停止</div>
+
+<div class="btn-row">
+  <button id="clear" class="act">清空</button>
+  <button id="send" class="act" disabled>发给小九 🐳</button>
+</div>
+
+<div id="msg"></div>
+<footer><a href="/" target="_blank">打开完整对话页 ↗</a> · 语音门 v0.2 · <span id="engine"></span> · Tailscale 加密通道</footer>
+
+<script>window.__VOICE_TOKEN='__VOICE_TOKEN__';
+(function(){
+  const $=id=>document.getElementById(id);
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const st=$('status'), box=$('box'), fin=$('final'), itm=$('interim'),
+        edit=$('edit'), mic=$('mic'), miclabel=$('miclabel'), send=$('send'),
+        clearBtn=$('clear'), msgEl=$('msg'), hint=$('hint');
+  let rec=null, listening=false, finalText='';
+
+  function setStatus(on,label){ st.className='status '+(on?'on':'off'); st.textContent=label; }
+
+  function setMsg(cls,text){ msgEl.className=cls; msgEl.textContent=text; }
+  function clearMsg(){ msgEl.className=''; msgEl.textContent=''; }
+
+  // 连接检查:与管家 API 握手
+  async function probe(){
+    try{
+      const r = await fetch('/api/session.list',{
+        method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':window.__VOICE_TOKEN||''},
+        body:JSON.stringify({type:'client-request',rpcId:'voice-probe-'+Date.now(),method:'session.list',payload:{}})
+      });
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const d = await r.json();
+      const items = d?.result?.value?.items || [];
+      const live = items.filter(i=>i.running).length;
+      setStatus(true, items.length? ('管家在线 · '+items.length+' 会话'):'管家在线');
+      if(!items.length) hint.textContent='✅ 连接正常!但管家会话没在运行,请先点右上「打开完整对话页」进入聊天,再回来说话。';
+    }catch(e){
+      setStatus(false,'离线');
+      hint.textContent='❌ 连不上管家:请确认手机 Tailscale 已连接同一账号,且 Mac 在线。';
+    }
+  }
+  probe();
+
+  document.getElementById('engine').textContent = SR ? '语音引擎:支持' : '语音引擎:不支持';
+  if(!SR){
+    mic.disabled=true; miclabel.textContent='此浏览器不支持网页听写';
+    hint.textContent='😢 当前浏览器不支持语音识别。两个替代方案:\n① 点下方输入框,用 iPhone 键盘上的 🎤 键听写后发送;\n② 或直接打字。';
+  }
+
+  function makeRec(){
+    const r = new SR();
+    r.lang='zh-CN'; r.continuous=false; r.interimResults=true;
+    r.onstart=()=>{ listening=true; mic.classList.add('listening'); miclabel.textContent='正在听…再说一次/点按停止'; itm.textContent=''; setMsg('',''); };
+    r.onresult=(ev)=>{
+      let interim='';
+      for(let i=ev.resultIndex;i<ev.results.length;i++){
+        const t=ev.results[i][0].transcript;
+        if(ev.results[i].isFinal) finalText += t; else interim += t;
+      }
+      fin.textContent=finalText; itm.textContent=interim;
+      edit.value=(finalText+interim).trim(); syncSend();
+    };
+    r.onerror=(ev)=>{
+      listening=false; mic.classList.remove('listening'); miclabel.textContent='点按:开始/停止';
+      if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){
+        setMsg('err','🚫 麦克风没授权:请在浏览器设置里允许本页使用麦克风,或点地址栏的 🎤 图标打开。');
+      } else if(ev.error!=='no-speech'){ setMsg('err','识别出错:'+ev.error+' (可以再试一次)'); }
+    };
+    r.onend=()=>{
+      listening=false; mic.classList.remove('listening'); miclabel.textContent='点按:开始/停止';
+      if(finalText){ edit.value=finalText.trim(); syncSend(); }
+    };
+    return r;
+  }
+
+  function syncSend(){
+    const t=edit.value.trim(); send.disabled=!t; if(t){ fin.textContent=''; itm.textContent=''; }
+  }
+  edit.addEventListener('input',syncSend);
+
+  mic.addEventListener('click',()=>{
+    if(listening){ if(rec){rec.stop();} return; }
+    if(!rec) rec=makeRec();
+    finalText=''; fin.textContent=''; itm.textContent=''; clearMsg();
+    try{ rec.start(); }
+    catch(e){
+      // iOS 上重复 start 偶发 InvalidStateError:重建再试
+      rec=makeRec(); rec.start();
+    }
+  });
+
+  clearBtn.addEventListener('click',()=>{
+    if(listening && rec) rec.stop();
+    finalText=''; fin.textContent=''; itm.textContent=''; edit.value=''; clearMsg(); syncSend();
+  });
+
+  async function findSession(){
+    const r = await fetch('/api/session.list',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({type:'client-request',rpcId:'voice-find-'+Date.now(),method:'session.list',payload:{}})
+    });
+    const d = await r.json();
+    const items = d?.result?.value?.items || [];
+    const live = items.filter(i=>i.running);
+    live.sort((a,b)=>(b?.projections?.values?.sessionStats?.turns||0)-(a?.projections?.values?.sessionStats?.turns||0));
+    if(live.length) return live[0].sessionId;
+    // 回退:running 标志会闪断,取历史 turns 最多的会话
+    const all = [...items].sort((a,b)=>(b?.projections?.values?.sessionStats?.turns||0)-(a?.projections?.values?.sessionStats?.turns||0));
+    return all[0]?.sessionId || null;
+  }
+
+  send.addEventListener('click',async()=>{
+    const text=edit.value.trim(); if(!text) return;
+    send.disabled=true; send.textContent='发送中…';
+    setMsg('','');
+    try{
+      const sid = await findSession();
+      if(!sid) throw new Error('管家会话没在运行:先点底部「打开完整对话页」进聊天,再回来发送');
+      const r = await fetch('/api/session.prompt',{headers:{'Content-Type':'application/json'},
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({type:'client-request',rpcId:'voice-send-'+Date.now(),method:'session.prompt',
+          payload:{sessionId:sid, mode:'queue', content:[{type:'text',text}]}})
+      });
+      const d = await r.json();
+      if(!d?.result?.ok) throw new Error('服务端未接受:'+JSON.stringify(d).slice(0,120));
+      setMsg('ok','✅ 已送达小九管家!它开始处理了,点下面「打开完整对话页」看回复 🐳');
+      edit.value=''; finalText=''; fin.textContent=''; itm.textContent='';
+    }catch(e){
+      setMsg('err','❌ 发送失败:'+e.message);
+    }finally{
+      send.textContent='发给小九 🐳'; send.disabled=!edit.value.trim();
+    }
+  });
+})();
+</script>
+</body>
+</html>

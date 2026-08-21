@@ -100,7 +100,7 @@ Auth: `X-Voice-Token: <token>` header (primary). `GET` query `token=`/`pin=` sti
 | Empty text | `400` `{"ok": false, "error": "text 为空"}` |
 | Text longer than 2000 chars | `413` `{"ok": false, "error": "太长"}` |
 | Local intent (time/backup/stock/status) | `200` `{"ok": true, "routed": "local", "answer": …}` |
-| Delivered to a DSH session | `200` `{"ok": true, "routed": "voice-session", "sessionSource": "requested|saved|voice-title|newest-running", "answer"/"pending"/"requestId": …}` |
+| Delivered to a DSH session | `200` `{"ok": true, "routed": "voice-session", "sessionId": "<id>", "sessionSource": "requested|saved|voice-title|newest-running", "answer"/"pending"/"requestId": …}` |
 | Session delivery failed (upstream `ok:false`, connection error, no session) | `502` (delivery failure) or `500` (session selection / upstream unreachable), always `"ok": false` with a short error — **never a fake success** |
 | Specified `sessionId` does not exist | `500` `{"ok": false, "error": "指定的会话不存在: …"}` |
 

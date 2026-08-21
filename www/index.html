@@ -162,18 +162,14 @@
     finalText=''; fin.textContent=''; itm.textContent=''; edit.value=''; clearMsg(); syncSend();
   });
 
-  async function findSession(){
-    // 客户端只做"有没有可用会话"的判断;具体选哪个会话交给服务端
-    // (requested→saved→voice-title→newest-running,不再引用不存在的 sessionStats.turns)
+  async function sessionStatus(){
+    // 只读探测:页面状态显示用,不选会话
     const r = await fetch('/api/session.list',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({type:'client-request',rpcId:'voice-find-'+Date.now(),method:'session.list',payload:{}})
     });
     const d = await r.json();
-    const items = d?.result?.value?.items || [];
-    const live = items.filter(i=>i.running);
-    if(live.length) return live[0].sessionId;
-    return items[0]?.sessionId || null;
+    return (d?.result?.value?.items || []).length;
   }
 
   send.addEventListener('click',async()=>{
@@ -181,16 +177,14 @@
     send.disabled=true; send.textContent='发送中…';
     setMsg('','');
     try{
-      const sid = await findSession();
-      if(!sid) throw new Error('管家会话没在运行:先点底部「打开完整对话页」进聊天,再回来发送');
-      const r = await fetch('/api/session.prompt',{headers:{'Content-Type':'application/json'},
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({type:'client-request',rpcId:'voice-send-'+Date.now(),method:'session.prompt',
-          payload:{sessionId:sid, mode:'queue', content:[{type:'text',text}]}})
-      });
+      // 走 /send:服务端负责选会话(requested→saved→voice-title→newest-running)并回传 sessionId/sessionSource
+      const r = await fetch('/send',{method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':window.__VOICE_TOKEN||''},
+        body:'text='+encodeURIComponent(text)});
       const d = await r.json();
-      if(!d?.result?.ok) throw new Error('服务端未接受:'+JSON.stringify(d).slice(0,120));
-      setMsg('ok','✅ 已送达小九管家!它开始处理了,点下面「打开完整对话页」看回复 🐳');
+      if(!r.ok || !d?.ok) throw new Error(d?.error || ('HTTP '+r.status));
+      if(d.answer){ setMsg('ok','✅ 管家回: '+d.answer); }
+      else { setMsg('ok','✅ 已送达小九管家!它开始处理了,点下面「打开完整对话页」看回复 🐳'); }
       edit.value=''; finalText=''; fin.textContent=''; itm.textContent='';
     }catch(e){
       setMsg('err','❌ 发送失败:'+e.message);

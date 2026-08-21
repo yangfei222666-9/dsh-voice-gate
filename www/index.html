@@ -163,6 +163,8 @@
   });
 
   async function findSession(){
+    // 客户端只做"有没有可用会话"的判断;具体选哪个会话交给服务端
+    // (requested→saved→voice-title→newest-running,不再引用不存在的 sessionStats.turns)
     const r = await fetch('/api/session.list',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({type:'client-request',rpcId:'voice-find-'+Date.now(),method:'session.list',payload:{}})
@@ -170,11 +172,8 @@
     const d = await r.json();
     const items = d?.result?.value?.items || [];
     const live = items.filter(i=>i.running);
-    live.sort((a,b)=>(b?.projections?.values?.sessionStats?.turns||0)-(a?.projections?.values?.sessionStats?.turns||0));
     if(live.length) return live[0].sessionId;
-    // 回退:running 标志会闪断,取历史 turns 最多的会话
-    const all = [...items].sort((a,b)=>(b?.projections?.values?.sessionStats?.turns||0)-(a?.projections?.values?.sessionStats?.turns||0));
-    return all[0]?.sessionId || null;
+    return items[0]?.sessionId || null;
   }
 
   send.addEventListener('click',async()=>{

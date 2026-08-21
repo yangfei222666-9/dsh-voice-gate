@@ -316,6 +316,20 @@ class SendEndpointTest(unittest.TestCase):
         self.assertEqual(body["routed"], "voice-session")
         self.assertEqual(body["answer"], "收到")
 
+    def test_delivered_response_includes_session_id(self):
+        # v0.4.1 契约:/send 外层响应必须回传实际投递的 sessionId(与 sessionSource 同源)
+        with mock.patch.object(voice_server, "_list_sessions",
+                               return_value=[session_item("s1", running=True, ts=1)]), \
+             mock.patch.object(voice_server, "_load_voice_session_id", return_value=None), \
+             mock.patch.object(voice_server, "api_value", return_value={}), \
+             mock.patch.object(voice_server, "_wait_for_correlated_reply",
+                               return_value=("收到", 1, 1)):
+            status, body = run_post("/send", "text=" + urllib.parse.quote("提醒 买牛奶"),
+                                    headers={"X-Voice-Token": voice_server.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("sessionId"), "s1")
+        self.assertTrue(body.get("sessionSource"))
+
     def test_upstream_connection_error_500(self):
         with mock.patch.object(voice_server, "_list_sessions",
                                side_effect=urllib.error.URLError("connection refused")):

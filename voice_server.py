@@ -552,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not delivered.get("ok"):
                     return self._json(502, delivered)
                 r["routed"] = "voice-session"
+                if delivered.get("sessionId"):
+                    r["sessionId"] = delivered["sessionId"]
                 if delivered.get("sessionSource"):
                     r["sessionSource"] = delivered["sessionSource"]
                 if delivered.get("answer"):

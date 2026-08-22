@@ -1,5 +1,9 @@
 # dsh-voice-gate 🐳
 
+> **痛点**:手机想给 DSH 发消息,打字麻烦、还要切网页。
+> **解法**:语音门——按住说话→转文字→一条 `/send` 直达会话;本地运行、零云中转;时间/备份/股价等意图本地即答。
+> **证据**:44 个测试(39 offline + 5 真实 E2E)全绿,CI 五矩阵,awesome-dsh 已收录,最新 tag v0.4.2。
+
 A **voice gate** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): speak a note on your phone, tap send, and it lands in your DSH session — locally, with no cloud relay.
 
 - 🎤 Mobile PWA page: hold-to-talk input (browser Web Speech API), text fallback, dark UI, whale icon

@@ -7,7 +7,7 @@
 #   VOICE_GATE_OPS_DIR / VOICE_GATE_BACKUP_SENTINELS / VOICE_GATE_PAPER_DIR / VOICE_GATE_STOCK_NAMES_JSON /
 #   VOICE_HEALTH_PORT / VOICE_GATE_SESSION_FILE / VOICE_GATE_SESSION_TITLE / VOICE_GATE_SESSION_PRESET
 import json, os, sys, time, hashlib, threading, urllib.request, urllib.parse, uuid, secrets
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.environ.get("VOICE_GATE_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "www")
 PORT = int(os.environ.get("VOICE_PORT") or os.environ.get("VOICE_GATE_PORT") or "3081")
@@ -385,7 +385,7 @@ def route_intent(text):
     t = text.lower()
     if any(k in t for k in ["备份", "backup", "哨兵"]):
         return backup_status(), None
-    if any(k in t for k in ["几点", "日期", "今天几号", "现在时间", "time"]):
+    if any(k in t for k in ["几点", "时间", "日期", "今天几号", "现在时间", "time", "what time"]):
         return now_text(), None
     if any(k in t for k in ["股价", "行情", "多少钱", "收盘", "查一下", "查查"]):
         q = stock_quote(t)
@@ -583,7 +583,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def _health_thread():
     try:
-        HTTPServer((BIND, HEALTH_PORT), HealthHandler).serve_forever()
+        ThreadingHTTPServer((BIND, HEALTH_PORT), HealthHandler).serve_forever()
     except Exception:
         pass
 
@@ -591,4 +591,4 @@ if __name__ == "__main__":
     os.makedirs(ROOT, exist_ok=True)
     _secure_reply_file()
     threading.Thread(target=_health_thread, daemon=True).start()
-    HTTPServer((BIND, PORT), Handler).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

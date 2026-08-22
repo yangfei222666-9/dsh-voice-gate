@@ -24,9 +24,10 @@ def _secret_file(name, auto_generate=True):
         return None
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     value = secrets.token_hex(16)
-    with open(path, "w") as f:
+    # TOCTOU 修复(七视角复审 8-23):os.open 直接以 0600 创建,消除"先写后 chmod"的窗口
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(value)
-    os.chmod(path, 0o600)
     print("已生成令牌文件: {} (0600,请勿外传)".format(path))
     return value
 
@@ -467,6 +468,11 @@ class Handler(BaseHTTPRequestHandler):
         rel = urllib.parse.unquote(parsed.path).lstrip("/") or "index.html"
         path = os.path.realpath(os.path.join(ROOT, rel))
         if os.path.commonpath([path, ROOT]) != ROOT or not os.path.isfile(path):
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        # 安全修复(七视角复审 8-23):静态服务只放行白名单扩展名,latest-reply.txt 等内部文件禁止直读
+        allowed_ext = (".html", ".css", ".js", ".png", ".svg", ".ico", ".json", ".webmanifest")
+        if not path.lower().endswith(allowed_ext):
             self._json(404, {"ok": False, "error": "not found"})
             return
         if path.endswith(".html"): ctype = "text/html; charset=utf-8"

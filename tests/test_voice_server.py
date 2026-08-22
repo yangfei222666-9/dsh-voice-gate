@@ -426,6 +426,17 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {"ok": True})
 
+    def test_internal_txt_blocked_from_static(self):
+        # 安全修复(七视角复审 8-23):latest-reply.txt 等内部文件不允许静态直读
+        import os
+        probe = os.path.join(voice_server.ROOT, "latest-reply.txt")
+        open(probe, "w").write("secret-reply")
+        try:
+            status, _ = run_get("/latest-reply.txt")
+            self.assertEqual(status, 404)
+        finally:
+            os.remove(probe)
+
 
 class StaticTest(unittest.TestCase):
     def test_index_served_with_token_injected(self):

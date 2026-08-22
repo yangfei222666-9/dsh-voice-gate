@@ -448,9 +448,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/reply":
+            q = urllib.parse.parse_qs(parsed.query)
+            if not self._check_auth(q):
+                return self._json(403, {"ok": False, "error": "token 无效"})
             self._serve_reply()
             return
         if parsed.path.startswith("/api/"):
+            q = urllib.parse.parse_qs(parsed.query)
+            if not self._check_auth(q):
+                return self._json(403, {"ok": False, "error": "token 无效"})
             self._proxy_api()
             return
         if parsed.path == "/send":
@@ -468,7 +474,9 @@ class Handler(BaseHTTPRequestHandler):
         else: ctype = "text/plain; charset=utf-8"
         data = open(path, "rb").read()
         if path.endswith(".html"):
-            data = data.replace(b"__VOICE_TOKEN__", TOKEN.encode("utf-8"))
+            # 安全修复(Codex 审计 8-23):真 token 只注入已鉴权请求,未鉴权访问拿到的是空占位
+            authed = (self.headers.get("X-Voice-Token") == TOKEN) or (PIN and self.headers.get("X-Voice-Pin") == PIN)
+            data = data.replace(b"__VOICE_TOKEN__", TOKEN.encode("utf-8") if authed else b"")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store, max-age=0")
@@ -496,6 +504,8 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(body)
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/api/"):
+            if not self._check_auth(q):
+                return self._json(403, {"ok": False, "error": "token 无效"})
             self._proxy_api_post(body)
             return
         if path == "/send":

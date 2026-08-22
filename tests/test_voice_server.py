@@ -365,6 +365,15 @@ class StubUpstream(BaseHTTPRequestHandler):
                 return self._reply(status, body)
         self._reply(404, b'{"ok":false,"error":"stub not found"}')
 
+    def do_POST(self):
+        # 支持 POST /api/* 代理测试(2026-08-23 安全修复配套)
+        ln = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(ln)
+        for path, status, body in StubUpstream.responses:
+            if self.path == path:
+                return self._reply(status, body)
+        self._reply(404, b'{"ok":false,"error":"stub not found"}')
+
 
 class ProxyTest(unittest.TestCase):
     """审计修复④:/api/* 反向代理——状态与 body 透传,上游不可达 502。"""
@@ -387,30 +396,46 @@ class ProxyTest(unittest.TestCase):
 
     def test_proxy_200_pass_through(self):
         StubUpstream.responses = [("/api/anything", 200, b'{"ok":true,"svc":"stub"}')]
-        status, body = run_get("/api/anything")
+        status, body = run_get("/api/anything", {"X-Voice-Token": voice_server.TOKEN})
         self.assertEqual(status, 200)
         self.assertEqual(body, {"ok": True, "svc": "stub"})
 
     def test_proxy_upstream_404_pass_through(self):
         StubUpstream.responses = [("/api/missing", 404, b'{"ok":false}')]
-        status, body = run_get("/api/missing")
+        status, body = run_get("/api/missing", {"X-Voice-Token": voice_server.TOKEN})
         self.assertEqual(status, 404)
         self.assertEqual(body, {"ok": False})
 
     def test_proxy_upstream_down_502(self):
         voice_server.API = "http://127.0.0.1:1"
-        status, body = run_get("/api/anything")
+        status, body = run_get("/api/anything", {"X-Voice-Token": voice_server.TOKEN})
         self.assertEqual(status, 502)
         self.assertFalse(body["ok"])
         self.assertIn("代理失败", body["error"])
 
+    def test_post_api_requires_token(self):
+        # 安全修复(Codex 审计 8-23):无 token 的 POST /api/* 必须 403
+        status, body = run_post("/api/anything", "{}", None)
+        self.assertEqual(status, 403)
+        self.assertEqual(body, {"ok": False, "error": "token 无效"})
+
+    def test_post_api_with_token_passes(self):
+        voice_server.API = self.upstream  # 防顺序依赖(前一个 502 测试改过 API)
+        StubUpstream.responses = [("/api/anything", 200, b'{"ok":true}')]
+        status, body = run_post("/api/anything", "{}", {"X-Voice-Token": voice_server.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True})
+
 
 class StaticTest(unittest.TestCase):
     def test_index_served_with_token_injected(self):
+        # 安全修复(Codex 审计 8-23):真 token 只注入已鉴权请求
         status, body = run_get("/")
         self.assertEqual(status, 200)
-        self.assertIn(voice_server.TOKEN, body)
-        self.assertNotIn("__VOICE_TOKEN__", body)
+        self.assertNotIn(voice_server.TOKEN, body)
+        status2, body2 = run_get("/", {"X-Voice-Token": voice_server.TOKEN})
+        self.assertIn(voice_server.TOKEN, body2)
+        self.assertNotIn("__VOICE_TOKEN__", body2)
 
     def test_path_traversal_blocked(self):
         status, body = run_get("/../LICENSE")

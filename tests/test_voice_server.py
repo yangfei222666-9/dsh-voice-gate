@@ -437,6 +437,28 @@ class ProxyTest(unittest.TestCase):
         finally:
             os.remove(probe)
 
+    def test_auth_pin_exchange(self):
+        # PIN 方案(8-23):正确 PIN 换 token,错误 PIN 403
+        saved_pin = voice_server.PIN
+        try:
+            voice_server.PIN = "123456"
+            status, body = run_post("/auth", "pin=123456", None)
+            self.assertEqual(status, 200)
+            self.assertEqual(body.get("token"), voice_server.TOKEN)
+            status2, _ = run_post("/auth", "pin=000000", None)
+            self.assertEqual(status2, 403)
+        finally:
+            voice_server.PIN = saved_pin
+
+    def test_auth_without_pin_configured_403(self):
+        saved_pin = voice_server.PIN
+        try:
+            voice_server.PIN = None
+            status, _ = run_post("/auth", "pin=123456", None)
+            self.assertEqual(status, 403)
+        finally:
+            voice_server.PIN = saved_pin
+
 
 class StaticTest(unittest.TestCase):
     def test_index_served_with_token_injected(self):

@@ -73,9 +73,26 @@
 </div>
 
 <div id="msg"></div>
+<div id="pinbar" style="display:none;gap:6px;margin:6px auto;max-width:320px">
+  <input id="pininput" inputmode="numeric" maxlength="6" placeholder="首次配对:输入 6 位 PIN" style="flex:1;padding:6px;border-radius:8px;border:1px solid #ccc">
+  <button id="pinok" style="padding:6px 10px;border-radius:8px;border:none;background:#1a73e8;color:#fff">配对</button>
+</div>
 <footer><a href="/" target="_blank">打开完整对话页 ↗</a> · 语音门 v0.2 · <span id="engine"></span> · Tailscale 加密通道</footer>
 
 <script>window.__VOICE_TOKEN='__VOICE_TOKEN__';
+const vgGetToken=()=>localStorage.getItem('vg_token')||window.__VOICE_TOKEN||'';
+async function vgEnsureToken(){
+  if(vgGetToken()) return true;
+  const bar=document.getElementById('pinbar');
+  if(bar) bar.style.display='flex';
+  const pin=await new Promise(res=>{ window.__vgPinResolve=res; });
+  const r=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(pin)});
+  if(!r.ok){ if(bar) bar.style.display='flex'; return vgEnsureToken(); }
+  const d=await r.json();
+  localStorage.setItem('vg_token', d.token);
+  if(bar) bar.style.display='none';
+  return true;
+}
 (function(){
   const $=id=>document.getElementById(id);
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -88,12 +105,17 @@
 
   function setMsg(cls,text){ msgEl.className=cls; msgEl.textContent=text; }
   function clearMsg(){ msgEl.className=''; msgEl.textContent=''; }
+  const pinok=$('pinok'), pininput=$('pininput');
+  if(pinok && pininput){
+    pinok.onclick=()=>{ const v=pininput.value.trim(); if(v.length===6 && window.__vgPinResolve){ window.__vgPinResolve(v); pininput.value=''; } };
+    pininput.onkeydown=(e)=>{ if(e.key==='Enter') pinok.onclick(); };
+  }
 
   // 连接检查:与管家 API 握手
   async function probe(){
     try{
       const r = await fetch('/api/session.list',{
-        method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':window.__VOICE_TOKEN||''},
+        method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':vgGetToken()},
         body:JSON.stringify({type:'client-request',rpcId:'voice-probe-'+Date.now(),method:'session.list',payload:{}})
       });
       if(!r.ok) throw new Error('HTTP '+r.status);
@@ -107,7 +129,7 @@
       hint.textContent='❌ 连不上管家:请确认手机 Tailscale 已连接同一账号,且 Mac 在线。';
     }
   }
-  probe();
+  (async()=>{ await vgEnsureToken(); probe(); })();
 
   document.getElementById('engine').textContent = SR ? '语音引擎:支持' : '语音引擎:不支持';
   if(!SR){
@@ -179,7 +201,7 @@
     try{
       // 走 /send:服务端负责选会话(requested→saved→voice-title→newest-running)并回传 sessionId/sessionSource
       const r = await fetch('/send',{method:'POST',
-        headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':window.__VOICE_TOKEN||''},
+        headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':vgGetToken()},
         body:'text='+encodeURIComponent(text)});
       const d = await r.json();
       if(!r.ok || !d?.ok) throw new Error(d?.error || ('HTTP '+r.status));

@@ -509,6 +509,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(ln).decode("utf-8", "replace") if ln else ""
         q = urllib.parse.parse_qs(body)
         path = urllib.parse.urlparse(self.path).path
+        if path == "/auth":
+            # PIN 换 token(2026-08-23):未鉴权页面拿不到真 token 后,PWA 用 6 位 PIN 兑换一次 token 存本地
+            pin = (q.get("pin") or [""])[0]
+            if PIN and pin and secrets.compare_digest(pin, PIN):
+                return self._json(200, {"ok": True, "token": TOKEN})
+            return self._json(403, {"ok": False, "error": "PIN 无效"})
         if path.startswith("/api/"):
             if not self._check_auth(q):
                 return self._json(403, {"ok": False, "error": "token 无效"})

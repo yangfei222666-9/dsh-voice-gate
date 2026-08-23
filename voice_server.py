@@ -415,7 +415,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy_api(self):
         """审计修复④:/api/* 反向代理到 DSH web(带原 header,20s 超时),页面默认安装即可开箱即用"""
-        upstream = API.rstrip("/") + self.path
+        stripped = self.path[6:] if self.path.startswith("/voice") else self.path  # P0 修复:剥前缀后转发
+        upstream = API.rstrip("/") + stripped
         headers = {}
         for k, v in self.headers.items():
             if k.lower() in ("host", "content-length", "connection", "accept-encoding"):
@@ -499,8 +500,10 @@ class Handler(BaseHTTPRequestHandler):
             data = open(os.path.join(ROOT, "latest-reply.txt"), "rb").read()
         except Exception:
             data = "(管家还没写回复)".encode("utf-8")
+        import json as _json
+        data = _json.dumps({"ok": True, "answer": data.decode("utf-8", "replace")}, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -539,7 +542,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _proxy_api_post(self, raw_body):
         """POST /api/* 代理:保留原始 body 转发"""
-        upstream = API.rstrip("/") + self.path
+        stripped = self.path[6:] if self.path.startswith("/voice") else self.path  # P0 修复:剥前缀后转发
+        upstream = API.rstrip("/") + stripped
         headers = {}
         for k, v in self.headers.items():
             if k.lower() in ("host", "content-length", "connection", "accept-encoding"):

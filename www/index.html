@@ -49,6 +49,12 @@
   #msg.err{ display:block; background:rgba(255,107,129,.12); color:var(--err); }
   footer{ text-align:center; font-size:11px; color:#4a5377; padding-bottom:6px; }
   a{ color:var(--accent2); }
+
+#chatlog{max-width:520px;margin:6px auto;padding:4px 10px;max-height:52vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.cb{max-width:82%;padding:8px 10px;border-radius:14px;font-size:15px;line-height:1.45;word-break:break-word;white-space:pre-wrap}
+.cb.me{align-self:flex-end;background:#1a73e8;color:#fff;border-bottom-right-radius:4px}
+.cb.bot{align-self:flex-start;background:#f1f3f4;color:#202124;border-bottom-left-radius:4px}
+.cb.sys{align-self:center;background:#e8eaed;color:#5f6368;font-size:12px;border-radius:10px}
 </style>
 </head>
 <body>
@@ -57,6 +63,7 @@
   <span id="status" class="status">连接中…</span>
 </header>
 
+<div id="chatlog"></div>
 <div id="box">
   <div class="hint" id="hint">点下方 🎤 按钮开始说话,说完自动转成文字;<br>满意就点「发给小九」,一条语音指令直达管家 🚀<br>长按会持续听,松手停止(部分机型只支持点按)。</div>
   <div id="final"></div><div id="interim"></div>
@@ -70,6 +77,7 @@
 <div class="btn-row">
   <button id="clear" class="act">清空</button>
   <button id="send" class="act" disabled>发给小九 🐳</button>
+  <button id="chkreply" class="act">查回复</button>
 </div>
 
 <div id="msg"></div>
@@ -81,12 +89,46 @@
 
 <script>window.__VOICE_TOKEN='__VOICE_TOKEN__';
 const vgGetToken=()=>localStorage.getItem('vg_token')||window.__VOICE_TOKEN||'';
+const vgChat=JSON.parse(localStorage.getItem('vg_chat')||'[]');
+function vgPush(who,text){
+  vgChat.push({who,text,t:Date.now()});
+  if(vgChat.length>60) vgChat.splice(0,vgChat.length-60);
+  localStorage.setItem('vg_chat',JSON.stringify(vgChat));
+  vgRender();
+}
+function vgRender(){
+  const el=document.getElementById('chatlog');
+  if(!el) return;
+  el.innerHTML=vgChat.map(m=>'<div class="cb '+m.who+'">'+m.text.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</div>').join('');
+  el.scrollTop=el.scrollHeight;
+}
+vgRender();
+let vgLastReply='';
+async function vgPollReply(){
+  try{
+    const r=await fetch('/voice/reply',{headers:{'X-Voice-Token':vgGetToken()}});
+    if(!r.ok) return false;
+    const d=await r.json();
+    if(d?.answer && d.answer!==vgLastReply && d.answer!=='(管家还没写回复)'){
+      vgLastReply=d.answer;
+      vgPush('bot','🐳 '+d.answer);
+      return true;
+    }
+    return false;
+  }catch(e){ return false; }
+}
+async function vgAutoPoll(n){
+  for(let i=0;i<n;i++){
+    await new Promise(r=>setTimeout(r,3000));
+    if(await vgPollReply()) break;
+  }
+}
 async function vgEnsureToken(){
   if(vgGetToken()) return true;
   const bar=document.getElementById('pinbar');
   if(bar) bar.style.display='flex';
   const pin=await new Promise(res=>{ window.__vgPinResolve=res; });
-  const r=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(pin)});
+  const r=await fetch('/voice/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(pin)});
   if(!r.ok){ if(bar) bar.style.display='flex'; return vgEnsureToken(); }
   const d=await r.json();
   localStorage.setItem('vg_token', d.token);
@@ -105,6 +147,14 @@ async function vgEnsureToken(){
 
   function setMsg(cls,text){ msgEl.className=cls; msgEl.textContent=text; }
   function clearMsg(){ msgEl.className=''; msgEl.textContent=''; }
+  const chk=$('chkreply');
+  if(chk){
+    chk.onclick=async()=>{
+      const got=await vgPollReply();
+      setMsg(got?'ok':'','');
+      if(!got) setMsg('','管家还没新回复');
+    };
+  }
   const pinok=$('pinok'), pininput=$('pininput');
   if(pinok && pininput){
     pinok.onclick=()=>{ const v=pininput.value.trim(); if(v.length===6 && window.__vgPinResolve){ window.__vgPinResolve(v); pininput.value=''; } };
@@ -114,7 +164,7 @@ async function vgEnsureToken(){
   // 连接检查:与管家 API 握手
   async function probe(){
     try{
-      const r = await fetch('/api/session.list',{
+      const r = await fetch('/voice/api/session.list',{
         method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':vgGetToken()},
         body:JSON.stringify({type:'client-request',rpcId:'voice-probe-'+Date.now(),method:'session.list',payload:{}})
       });
@@ -186,7 +236,7 @@ async function vgEnsureToken(){
 
   async function sessionStatus(){
     // 只读探测:页面状态显示用,不选会话
-    const r = await fetch('/api/session.list',{
+    const r = await fetch('/voice/api/session.list',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({type:'client-request',rpcId:'voice-find-'+Date.now(),method:'session.list',payload:{}})
     });
@@ -200,13 +250,15 @@ async function vgEnsureToken(){
     setMsg('','');
     try{
       // 走 /send:服务端负责选会话(requested→saved→voice-title→newest-running)并回传 sessionId/sessionSource
-      const r = await fetch('/send',{method:'POST',
+      const r = await fetch('/voice/send',{method:'POST',
         headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':vgGetToken()},
         body:'text='+encodeURIComponent(text)});
       const d = await r.json();
       if(!r.ok || !d?.ok) throw new Error(d?.error || ('HTTP '+r.status));
-      if(d.answer){ setMsg('ok','✅ 管家回: '+d.answer); }
-      else { setMsg('ok','✅ 已送达小九管家!它开始处理了,点下面「打开完整对话页」看回复 🐳'); }
+      vgPush('me',text);
+      if(d.answer){ vgLastReply=d.answer; vgPush('bot','🐳 '+d.answer); }
+      else { vgPush('sys','已送达,管家处理中…'); vgAutoPoll(12); }
+      setMsg('ok','✅ 已送达');
       edit.value=''; finalText=''; fin.textContent=''; itm.textContent='';
     }catch(e){
       setMsg('err','❌ 发送失败:'+e.message);

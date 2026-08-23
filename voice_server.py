@@ -448,6 +448,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        # /voice 前缀兼容(2026-08-24):tailscale serve 的 /voice 路径代理保留路径,这里剥掉前缀
+        if parsed.path.startswith("/voice"):
+            parsed = urllib.parse.urlparse("/" + parsed.path[len("/voice"):].lstrip("/"))
         if parsed.path == "/reply":
             q = urllib.parse.parse_qs(parsed.query)
             if not self._check_auth(q):
@@ -509,12 +512,21 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(ln).decode("utf-8", "replace") if ln else ""
         q = urllib.parse.parse_qs(body)
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/voice"):
+            path = "/" + path[len("/voice"):].lstrip("/")
         if path == "/auth":
-            # PIN 换 token(2026-08-23):未鉴权页面拿不到真 token 后,PWA 用 6 位 PIN 兑换一次 token 存本地
+            # 一次性配对码(2026-08-24):PWA 用 6 位码兑换 token;配对成功即作废码(文件删除+内存置空)
+            global PIN
             pin = (q.get("pin") or [""])[0]
+            print(f"[voice-gate] /auth 请求: pin={'*'*len(pin) if pin else '空'}", file=sys.stderr, flush=True)
             if PIN and pin and secrets.compare_digest(pin, PIN):
-                return self._json(200, {"ok": True, "token": TOKEN})
-            return self._json(403, {"ok": False, "error": "PIN 无效"})
+                PIN = None
+                try:
+                    os.remove(os.path.expanduser("~/.config/voice-gate.pin"))
+                except OSError:
+                    pass
+                return self._json(200, {"ok": True, "token": TOKEN, "paired": True})
+            return self._json(403, {"ok": False, "error": "PIN 无效或已作废"})
         if path.startswith("/api/"):
             if not self._check_auth(q):
                 return self._json(403, {"ok": False, "error": "token 无效"})

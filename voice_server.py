@@ -2,11 +2,11 @@
 # dsh-voice-gate v0.4:为 DeepSeek Harness 加一个"语音门"——手机一句话,直达你的 DSH 会话
 # 零第三方依赖(Python 标准库);静态页 + /send 一键投递 + 常听意图路由 + /api/* 反向代理
 # v0.4 审计修复(2026-08-21):①假成功(ok=false 必报错)②会话选择多字段时间戳+如实标注 sessionSource
-#   ③鉴权 header 优先(X-Voice-Token),GET query 兼容但弃用 ④/api/* 代理(GET+POST,原 header 透传,20s 超时)
+#   ③鉴权只接受 X-Voice-Token header,配对 PIN 只接受 /auth body ④/api/* 代理(GET+POST,20s 超时)
 # 配置全部走环境变量(见 README):VOICE_GATE_ROOT / VOICE_PORT / VOICE_GATE_DSH_API / VOICE_GATE_BIND /
 #   VOICE_GATE_OPS_DIR / VOICE_GATE_BACKUP_SENTINELS / VOICE_GATE_PAPER_DIR / VOICE_GATE_STOCK_NAMES_JSON /
 #   VOICE_HEALTH_PORT / VOICE_GATE_SESSION_FILE / VOICE_GATE_SESSION_TITLE / VOICE_GATE_SESSION_PRESET
-import json, os, sys, time, hashlib, threading, urllib.request, urllib.parse, uuid, secrets
+import json, os, sys, time, hashlib, threading, urllib.request, urllib.parse, uuid, secrets, socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.environ.get("VOICE_GATE_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "www")
@@ -15,6 +15,13 @@ BIND = os.environ.get("VOICE_GATE_BIND") or "127.0.0.1"
 API = os.environ.get("VOICE_GATE_DSH_API") or os.environ.get("DSH_API") or "http://127.0.0.1:3080"
 HEALTH_PORT = int(os.environ.get("VOICE_HEALTH_PORT") or "8899")
 MAX_LEN = 2000
+MAX_FORM_BODY = 32 * 1024
+MAX_API_BODY = 1024 * 1024
+BODY_READ_TIMEOUT = 5
+PAIR_MAX_FAILURES = 5
+PAIR_FAILURE_WINDOW = 60
+PAIR_LOCK_SECONDS = 300
+PAIR_MAX_SOURCES = 1024
 
 def _secret_file(name, auto_generate=True):
     path = os.path.expanduser(os.path.join("~/.config", name))
@@ -33,6 +40,66 @@ def _secret_file(name, auto_generate=True):
 
 TOKEN = _secret_file("voice-gate.token")
 PIN = _secret_file("voice-gate.pin", auto_generate=False)
+_PAIR_FAILURES = {}
+_PAIR_FAILURES_LOCK = threading.Lock()
+
+def _secret_matches(candidate, configured):
+    """只比较非空字符串凭据,避免空配置与缺失 header 等值通过。"""
+    if not isinstance(candidate, str) or not isinstance(configured, str):
+        return False
+    if not candidate or not configured:
+        return False
+    return secrets.compare_digest(candidate.encode("utf-8"), configured.encode("utf-8"))
+
+def _token_matches(candidate):
+    return _secret_matches(candidate, TOKEN)
+
+def _prune_pair_failures(now):
+    stale_after = max(PAIR_FAILURE_WINDOW, PAIR_LOCK_SECONDS)
+    for source, state in list(_PAIR_FAILURES.items()):
+        if state["locked_until"] <= now and now - state["last_seen"] > stale_after:
+            _PAIR_FAILURES.pop(source, None)
+
+def _consume_pairing_pin(source, candidate, now=None):
+    """原子校验一次性 PIN;按 TCP peer 统计失败窗口并锁定来源。"""
+    global PIN
+    now = time.monotonic() if now is None else now
+    source = source or "<unknown>"
+    with _PAIR_FAILURES_LOCK:
+        _prune_pair_failures(now)
+        state = _PAIR_FAILURES.get(source)
+        if state and state["locked_until"] > now:
+            retry = max(1, int(state["locked_until"] - now + 0.999))
+            return "locked", retry
+
+        if _secret_matches(candidate, PIN):
+            PIN = None
+            _PAIR_FAILURES.pop(source, None)
+            return "ok", 0
+
+        if state is None:
+            if len(_PAIR_FAILURES) >= PAIR_MAX_SOURCES:
+                oldest = min(_PAIR_FAILURES, key=lambda key: _PAIR_FAILURES[key]["last_seen"])
+                _PAIR_FAILURES.pop(oldest, None)
+            state = {"failures": [], "locked_until": 0.0, "last_seen": now}
+            _PAIR_FAILURES[source] = state
+
+        recent = [ts for ts in state["failures"] if now - ts <= PAIR_FAILURE_WINDOW]
+        recent.append(now)
+        state["failures"] = recent
+        state["last_seen"] = now
+        if len(recent) >= PAIR_MAX_FAILURES:
+            state["failures"] = []
+            state["locked_until"] = now + PAIR_LOCK_SECONDS
+            return "locked", PAIR_LOCK_SECONDS
+        return "invalid", 0
+
+def _restore_pairing_pin(candidate):
+    """持久作废失败时恢复内存 PIN;期间不会向任何请求发放 token。"""
+    global PIN
+    with _PAIR_FAILURES_LOCK:
+        if PIN is None:
+            PIN = candidate
 
 VOICE_SESSION_FILE = os.environ.get("VOICE_GATE_SESSION_FILE") or os.path.expanduser("~/.config/voice-gate-session.json")
 VOICE_SESSION_TITLE = os.environ.get("VOICE_GATE_SESSION_TITLE") or "手机语音门"
@@ -346,7 +413,7 @@ def _tail2000(path):
             f.seek(max(0, size - 2000))
             return f.read()
     except Exception:
-        return b""
+        return None
 
 def backup_status():
     """哨兵比对:两副本 receipts.jsonl 尾行哈希互比(本地账本备份后必然增长,不以本机为基准)。
@@ -371,9 +438,13 @@ def backup_status():
                 last_fail = d.get("err", "")[:60]
     except Exception:
         pass
-    hashes = [hashlib.sha1(_tail2000(p)).hexdigest()[:12] for p in SENTINELS]
-    same = (hashes[0] == hashes[1] and hashes[0] != "")
-    line = "备份:两副本哨兵{};今日失败 {} 段".format("一致 ✅" if same else "不一致 ⚠️", fails_today)
+    tails = [_tail2000(p) for p in SENTINELS[:2]]
+    if any(tail is None or not tail for tail in tails):
+        sentinel_state = " BLOCKED/unknown"
+    else:
+        hashes = [hashlib.sha1(tail).hexdigest()[:12] for tail in tails]
+        sentinel_state = "一致 ✅" if hashes[0] == hashes[1] else "不一致 ⚠️"
+    line = "备份:两副本哨兵{};今日失败 {} 段".format(sentinel_state, fails_today)
     if fails_today and last_fail:
         line += "({})".format(last_fail)
     return line
@@ -392,7 +463,22 @@ def route_intent(text):
         q = stock_quote(t)
         if q:
             return q, None
-    if any(k in t for k in ["在吗", "状态", "活着吗", "alive"]):
+    status_text = t.strip().rstrip("。！？!?").strip()
+    status_subjects = ("状态", "当前状态", "现在状态", "管家状态", "服务状态")
+    status_intents = {
+        "在吗", "你在吗", "管家在吗", "还在吗", "你还在吗", "管家还在吗",
+        "在线吗", "你在线吗", "管家在线吗",
+        "活着吗", "你活着吗", "管家活着吗", "alive", "are you alive",
+        "现在什么状态", "现在是什么状态", "当前是什么状态",
+    }
+    status_intents.update(status_subjects)
+    status_intents.update(prefix + subject
+                          for prefix in ("查", "查询", "查看", "检查", "请查", "请查询", "请查看", "请检查")
+                          for subject in status_subjects)
+    status_intents.update(subject + suffix
+                          for subject in status_subjects
+                          for suffix in ("如何", "怎么样", "正常吗", "是否正常"))
+    if status_text in status_intents:
         return "我在,管家在线 🐳 " + now_text() + ";" + backup_status(), None
     if t.startswith(("提醒", "记得", "别忘了", "待办")):
         return "已记下并转给管家 📝:" + text[:50], "【提醒】" + text
@@ -402,16 +488,112 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _check_auth(self, q):
-        """审计修复:token 优先走 X-Voice-Token header(POST);GET query 参数兼容但标 deprecated"""
-        header_token = self.headers.get("X-Voice-Token")
-        if header_token == TOKEN:
-            return True
-        if (q.get("token") or [""])[0] == TOKEN or (PIN and (q.get("pin") or [""])[0] == PIN):
-            print("[voice-gate] 警告:GET query token/PIN 已弃用,请改用 X-Voice-Token header(POST)",
-                  file=sys.stderr)
+    @staticmethod
+    def _normalized_path(path):
+        if path.startswith("/voice"):
+            return "/" + path[len("/voice"):].lstrip("/")
+        return path
+
+    def _reject_query_credentials(self, parsed):
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if any(key.lower() in ("token", "pin") for key in query):
+            self._json(400, {"ok": False, "error":
+                       "查询参数禁止携带凭据;token 请用 X-Voice-Token header,PIN 请用 POST /auth body"})
             return True
         return False
+
+    def _check_auth(self):
+        """已配对请求只接受非空 X-Voice-Token header。"""
+        return _token_matches(self.headers.get("X-Voice-Token"))
+
+    def _validated_content_length(self, limit):
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "不支持 Transfer-Encoding"})
+            return None
+        if hasattr(self.headers, "get_all"):
+            length_headers = self.headers.get_all("Content-Length") or []
+            if len(length_headers) > 1:
+                self.close_connection = True
+                self._json(400, {"ok": False, "error": "Content-Length 重复"})
+                return None
+            raw = length_headers[0] if length_headers else None
+        else:
+            raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 0
+        if "," in str(raw):
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "Content-Length 无效"})
+            return None
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "Content-Length 无效"})
+            return None
+        if length < 0:
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "Content-Length 无效"})
+            return None
+        if length > limit:
+            self.close_connection = True
+            self._json(413, {"ok": False, "error": "请求正文过大"})
+            return None
+        return length
+
+    def _read_body(self, length):
+        if length == 0:
+            return b""
+        connection = getattr(self, "connection", None)
+        old_timeout = None
+        timeout_set = False
+        if connection is not None and hasattr(connection, "settimeout"):
+            try:
+                old_timeout = connection.gettimeout()
+                timeout_set = True
+            except OSError:
+                self.close_connection = True
+                self._json(500, {"ok": False, "error": "无法设置正文读取超时"})
+                return None
+        chunks = []
+        remaining = length
+        deadline = time.monotonic() + BODY_READ_TIMEOUT
+        read_error = None
+        try:
+            while remaining:
+                seconds_left = deadline - time.monotonic()
+                if seconds_left <= 0:
+                    read_error = "timeout"
+                    break
+                if timeout_set:
+                    connection.settimeout(max(0.001, seconds_left))
+                reader = getattr(self.rfile, "read1", self.rfile.read)
+                chunk = reader(min(64 * 1024, remaining))
+                if not chunk:
+                    read_error = "short"
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except (socket.timeout, TimeoutError):
+            read_error = "timeout"
+        except OSError:
+            read_error = "io"
+        finally:
+            if timeout_set:
+                try:
+                    connection.settimeout(old_timeout)
+                except OSError:
+                    self.close_connection = True
+        if read_error == "timeout":
+            self.close_connection = True
+            self._json(408, {"ok": False, "error": "请求正文读取超时"})
+            return None
+        if read_error in ("io", "short") or remaining:
+            self.close_connection = True
+            self._json(400, {"ok": False, "error": "请求正文不完整"})
+            return None
+        return b"".join(chunks)
 
     def _proxy_api(self):
         """审计修复④:/api/* 反向代理到 DSH web(带原 header,20s 超时),页面默认安装即可开箱即用"""
@@ -419,14 +601,11 @@ class Handler(BaseHTTPRequestHandler):
         upstream = API.rstrip("/") + stripped
         headers = {}
         for k, v in self.headers.items():
-            if k.lower() in ("host", "content-length", "connection", "accept-encoding"):
+            if k.lower() in ("host", "content-length", "connection", "accept-encoding",
+                              "x-voice-token", "x-voice-pin"):
                 continue
             headers[k] = v
-        body = None
-        if self.command == "POST":
-            ln = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(ln) if ln else None
-        req = urllib.request.Request(upstream, data=body, headers=headers, method=self.command)
+        req = urllib.request.Request(upstream, data=None, headers=headers, method=self.command)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 data = resp.read()
@@ -449,27 +628,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if self._reject_query_credentials(parsed):
+            return
         # /voice 前缀兼容(2026-08-24):tailscale serve 的 /voice 路径代理保留路径,这里剥掉前缀
-        if parsed.path.startswith("/voice"):
-            parsed = urllib.parse.urlparse("/" + parsed.path[len("/voice"):].lstrip("/"))
-        if parsed.path == "/reply":
+        path_only = self._normalized_path(parsed.path)
+        if path_only == "/reply":
             q = urllib.parse.parse_qs(parsed.query)
-            if not self._check_auth(q):
+            if not self._check_auth():
                 return self._json(403, {"ok": False, "error": "token 无效"})
             self._serve_reply()
             return
-        if parsed.path.startswith("/api/"):
+        if path_only.startswith("/api/"):
             q = urllib.parse.parse_qs(parsed.query)
-            if not self._check_auth(q):
+            if not self._check_auth():
                 return self._json(403, {"ok": False, "error": "token 无效"})
             self._proxy_api()
             return
-        if parsed.path == "/send":
+        if path_only == "/send":
             q = urllib.parse.parse_qs(parsed.query)
             self._handle_send(q)
             return
         # 静态文件
-        rel = urllib.parse.unquote(parsed.path).lstrip("/") or "index.html"
+        rel = urllib.parse.unquote(path_only).lstrip("/") or "index.html"
         path = os.path.realpath(os.path.join(ROOT, rel))
         if os.path.commonpath([path, ROOT]) != ROOT or not os.path.isfile(path):
             self._json(404, {"ok": False, "error": "not found"})
@@ -485,7 +665,7 @@ class Handler(BaseHTTPRequestHandler):
         data = open(path, "rb").read()
         if path.endswith(".html"):
             # 安全修复(Codex 审计 8-23):真 token 只注入已鉴权请求,未鉴权访问拿到的是空占位
-            authed = (self.headers.get("X-Voice-Token") == TOKEN) or (PIN and self.headers.get("X-Voice-Pin") == PIN)
+            authed = _token_matches(self.headers.get("X-Voice-Token"))
             data = data.replace(b"__VOICE_TOKEN__", TOKEN.encode("utf-8") if authed else b"")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -510,35 +690,55 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        # 快捷指令走 POST 表单(Codex 审计 P0 修复:原配方只有 GET 实现)
-        ln = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(ln).decode("utf-8", "replace") if ln else ""
-        q = urllib.parse.parse_qs(body)
-        path = urllib.parse.urlparse(self.path).path
-        if path.startswith("/voice"):
-            path = "/" + path[len("/voice"):].lstrip("/")
+        parsed = urllib.parse.urlparse(self.path)
+        if self._reject_query_credentials(parsed):
+            return
+        path = self._normalized_path(parsed.path)
+        if path == "/auth" or path == "/send":
+            body_limit = MAX_FORM_BODY
+        elif path.startswith("/api/"):
+            body_limit = MAX_API_BODY
+        else:
+            return self._json(404, {"ok": False, "error": "not found"})
+        ln = self._validated_content_length(body_limit)
+        if ln is None:
+            return
+        # /auth 必须先读受限 PIN body;其他 POST 必须先鉴权,不得读取未鉴权正文。
+        if path != "/auth" and not self._check_auth():
+            return self._json(403, {"ok": False, "error": "token 无效"})
+        raw_body = self._read_body(ln)
+        if raw_body is None:
+            return
+        body = raw_body.decode("utf-8", "replace")
         if path == "/auth":
             # 一次性配对码(2026-08-24):PWA 用 6 位码兑换 token;配对成功即作废码(文件删除+内存置空)
-            global PIN
+            if not TOKEN:
+                return self._json(503, {"ok": False, "error": "服务 token 未配置"})
+            q = urllib.parse.parse_qs(body)
             pin = (q.get("pin") or [""])[0]
             print(f"[voice-gate] /auth 请求: pin={'*'*len(pin) if pin else '空'}", file=sys.stderr, flush=True)
-            if PIN and pin and secrets.compare_digest(pin, PIN):
-                PIN = None
+            source = self.client_address[0] if getattr(self, "client_address", None) else "<unknown>"
+            outcome, retry = _consume_pairing_pin(source, pin)
+            if outcome == "locked":
+                return self._json(429, {"ok": False, "error": "配对尝试过多,来源已临时锁定",
+                                        "retryAfter": retry}, {"Retry-After": str(retry)})
+            if outcome == "ok":
                 try:
                     os.remove(os.path.expanduser("~/.config/voice-gate.pin"))
-                except OSError:
+                except FileNotFoundError:
                     pass
+                except OSError:
+                    _restore_pairing_pin(pin)
+                    return self._json(500, {"ok": False, "error": "配对码持久作废失败,未发放 token"})
                 return self._json(200, {"ok": True, "token": TOKEN, "paired": True})
             return self._json(403, {"ok": False, "error": "PIN 无效或已作废"})
         if path.startswith("/api/"):
-            if not self._check_auth(q):
-                return self._json(403, {"ok": False, "error": "token 无效"})
-            self._proxy_api_post(body)
+            self._proxy_api_post(raw_body)
             return
         if path == "/send":
+            q = urllib.parse.parse_qs(body)
             self._handle_send(q)
             return
-        self._json(404, {"ok": False, "error": "not found"})
 
     def _proxy_api_post(self, raw_body):
         """POST /api/* 代理:保留原始 body 转发"""
@@ -546,7 +746,8 @@ class Handler(BaseHTTPRequestHandler):
         upstream = API.rstrip("/") + stripped
         headers = {}
         for k, v in self.headers.items():
-            if k.lower() in ("host", "content-length", "connection", "accept-encoding"):
+            if k.lower() in ("host", "content-length", "connection", "accept-encoding",
+                              "x-voice-token", "x-voice-pin"):
                 continue
             headers[k] = v
         req = urllib.request.Request(upstream, data=raw_body.encode("utf-8") if isinstance(raw_body, str) else raw_body,
@@ -572,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle_send(self, q):
-        if not self._check_auth(q):
+        if not self._check_auth():
             return self._json(403, {"ok": False, "error": "token 无效"})
         text = (q.get("text") or [""])[0].strip()
         if not text:
@@ -604,11 +805,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"ok": False, "error": str(e)[:120]})
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, extra_headers=None):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store, max-age=0")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

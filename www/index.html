@@ -89,6 +89,85 @@
 
 <script>window.__VOICE_TOKEN='__VOICE_TOKEN__';
 const vgGetToken=()=>localStorage.getItem('vg_token')||window.__VOICE_TOKEN||'';
+const vgAuthRejected=r=>r.status===401||r.status===403;
+let vgPairPromise=null;
+function vgShowPairing(message=''){
+  const bar=document.getElementById('pinbar');
+  if(bar) bar.style.display='flex';
+  if(message){
+    const msg=document.getElementById('msg');
+    if(msg){ msg.className='err'; msg.textContent=message; }
+  }
+}
+function vgHidePairing(){
+  const bar=document.getElementById('pinbar');
+  if(bar) bar.style.display='none';
+  const msg=document.getElementById('msg');
+  if(msg && msg.className==='err'){ msg.className=''; msg.textContent=''; }
+}
+function vgInvalidateToken(usedToken,message='配对已失效,请输入新的 6 位 PIN'){
+  const current=vgGetToken();
+  // 迟到的旧 401/403 不能删除另一请求刚换到的新 token。
+  if(usedToken && current && usedToken!==current) return false;
+  localStorage.removeItem('vg_token');
+  window.__VOICE_TOKEN='';
+  vgShowPairing(message);
+  return true;
+}
+async function vgValidateToken(token){
+  try{
+    const r=await fetch('/voice/reply',{headers:{'X-Voice-Token':token}});
+    if(vgAuthRejected(r)){
+      vgInvalidateToken(token);
+      return false;
+    }
+    return true;
+  }catch(e){
+    // 网络故障不能证明 token 失效,保留已配对状态交给 probe 如实显示离线。
+    return true;
+  }
+}
+function vgWaitForPin(){
+  vgShowPairing();
+  return new Promise(resolve=>{ window.__vgPinResolve=resolve; });
+}
+async function vgPairLoop(){
+  while(!vgGetToken()){
+    const pin=await vgWaitForPin();
+    let r, d={};
+    try{
+      r=await fetch('/voice/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(pin)});
+      try{ d=await r.json(); }catch(e){ d={}; }
+    }catch(e){
+      vgShowPairing('配对请求失败,请检查网络后重试');
+      continue;
+    }
+    if(!r.ok || !d?.token){
+      const wait=d?.retryAfter?(' 请等待 '+d.retryAfter+' 秒后重试'):'';
+      vgShowPairing((d?.error||('配对失败 HTTP '+r.status))+wait);
+      continue;
+    }
+    try{
+      localStorage.setItem('vg_token',d.token);
+    }catch(e){
+      // Safari 私密模式若禁用持久存储,仍允许本页会话继续。
+      window.__VOICE_TOKEN=d.token;
+    }
+    vgHidePairing();
+  }
+  return true;
+}
+async function vgEnsureToken(validateExisting=true){
+  const existing=vgGetToken();
+  if(existing && (!validateExisting || await vgValidateToken(existing))) return true;
+  if(!vgPairPromise){
+    vgPairPromise=(async()=>{
+      try{ return await vgPairLoop(); }
+      finally{ vgPairPromise=null; }
+    })();
+  }
+  return vgPairPromise;
+}
 const vgChat=JSON.parse(localStorage.getItem('vg_chat')||'[]');
 function vgPush(who,text){
   vgChat.push({who,text,t:Date.now()});
@@ -106,7 +185,12 @@ vgRender();
 let vgLastReply='';
 async function vgPollReply(){
   try{
-    const r=await fetch('/voice/reply',{headers:{'X-Voice-Token':vgGetToken()}});
+    const usedToken=vgGetToken();
+    const r=await fetch('/voice/reply',{headers:{'X-Voice-Token':usedToken}});
+    if(vgAuthRejected(r)){
+      if(vgInvalidateToken(usedToken)) void vgEnsureToken(false);
+      return null;
+    }
     if(!r.ok) return false;
     const d=await r.json();
     if(d?.answer && d.answer!==vgLastReply && d.answer!=='(管家还没写回复)'){
@@ -120,20 +204,9 @@ async function vgPollReply(){
 async function vgAutoPoll(n){
   for(let i=0;i<n;i++){
     await new Promise(r=>setTimeout(r,3000));
-    if(await vgPollReply()) break;
+    const got=await vgPollReply();
+    if(got || got===null) break;
   }
-}
-async function vgEnsureToken(){
-  if(vgGetToken()) return true;
-  const bar=document.getElementById('pinbar');
-  if(bar) bar.style.display='flex';
-  const pin=await new Promise(res=>{ window.__vgPinResolve=res; });
-  const r=await fetch('/voice/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(pin)});
-  if(!r.ok){ if(bar) bar.style.display='flex'; return vgEnsureToken(); }
-  const d=await r.json();
-  localStorage.setItem('vg_token', d.token);
-  if(bar) bar.style.display='none';
-  return true;
 }
 (function(){
   const $=id=>document.getElementById(id);
@@ -151,23 +224,35 @@ async function vgEnsureToken(){
   if(chk){
     chk.onclick=async()=>{
       const got=await vgPollReply();
+      if(got===null) return;
       setMsg(got?'ok':'','');
       if(!got) setMsg('','管家还没新回复');
     };
   }
   const pinok=$('pinok'), pininput=$('pininput');
   if(pinok && pininput){
-    pinok.onclick=()=>{ const v=pininput.value.trim(); if(v.length===6 && window.__vgPinResolve){ window.__vgPinResolve(v); pininput.value=''; } };
+    pinok.onclick=()=>{
+      const v=pininput.value.trim(), resolve=window.__vgPinResolve;
+      if(/^\d{6}$/.test(v) && resolve){ window.__vgPinResolve=null; resolve(v); pininput.value=''; }
+    };
     pininput.onkeydown=(e)=>{ if(e.key==='Enter') pinok.onclick(); };
   }
 
   // 连接检查:与管家 API 握手
   async function probe(){
     try{
+      const usedToken=vgGetToken();
       const r = await fetch('/voice/api/session.list',{
-        method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':vgGetToken()},
+        method:'POST', headers:{'Content-Type':'application/json','X-Voice-Token':usedToken},
         body:JSON.stringify({type:'client-request',rpcId:'voice-probe-'+Date.now(),method:'session.list',payload:{}})
       });
+      if(vgAuthRejected(r)){
+        // /api/* 可能透传上游 401/403;先用本地 /reply 确认 voice token,避免误清。
+        if(!await vgValidateToken(usedToken)){
+          await vgEnsureToken(false);
+          return probe();
+        }
+      }
       if(!r.ok) throw new Error('HTTP '+r.status);
       const d = await r.json();
       const items = d?.result?.value?.items || [];
@@ -250,9 +335,14 @@ async function vgEnsureToken(){
     setMsg('','');
     try{
       // 走 /send:服务端负责选会话(requested→saved→voice-title→newest-running)并回传 sessionId/sessionSource
+      const usedToken=vgGetToken();
       const r = await fetch('/voice/send',{method:'POST',
-        headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':vgGetToken()},
+        headers:{'Content-Type':'application/x-www-form-urlencoded','X-Voice-Token':usedToken},
         body:'text='+encodeURIComponent(text)});
+      if(vgAuthRejected(r)){
+        if(vgInvalidateToken(usedToken)) void vgEnsureToken(false);
+        throw new Error('配对已失效,请重新配对后重试');
+      }
       const d = await r.json();
       if(!r.ok || !d?.ok) throw new Error(d?.error || ('HTTP '+r.status));
       vgPush('me',text);

@@ -247,6 +247,30 @@ class SendTextTest(unittest.TestCase):
                 voice_server.send_text("hello")
 
 
+class RouteIntentTest(unittest.TestCase):
+    def test_status_substring_in_work_instructions_is_forwarded(self):
+        instructions = (
+            "请把项目状态更新为完成",
+            "同步任务状态到总控",
+            "根据当前状态继续修复",
+        )
+        for text in instructions:
+            with self.subTest(text=text):
+                answer, forward = voice_server.route_intent(text)
+                self.assertEqual(answer, "")
+                self.assertEqual(forward, "【语音】" + text)
+
+    def test_explicit_status_queries_and_commands_stay_local(self):
+        for text in (
+            "状态", "查看状态", "管家状态如何？", "在吗",
+            "你还在吗？", "管家还在吗？", "are you alive?",
+        ):
+            with self.subTest(text=text):
+                answer, forward = voice_server.route_intent(text)
+                self.assertTrue(answer)
+                self.assertIsNone(forward)
+
+
 class SendEndpointTest(unittest.TestCase):
     def test_post_header_token_accepted(self):
         status, body = run_post("/send", "text=" + urllib.parse.quote("几点"),
@@ -266,18 +290,31 @@ class SendEndpointTest(unittest.TestCase):
                                 headers={"X-Voice-Token": "wrong"})
         self.assertEqual(status, 403)
 
-    def test_get_query_token_deprecated_compat(self):
-        q = "/send?" + urllib.parse.urlencode({"token": voice_server.TOKEN, "text": "几点"})
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            status, body = run_get(q)
+    def test_get_header_token_accepted(self):
+        q = "/send?" + urllib.parse.urlencode({"text": "几点"})
+        status, body = run_get(q, headers={"X-Voice-Token": voice_server.TOKEN})
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertIn("已弃用", err.getvalue())  # deprecation warning surfaced
+        self.assertEqual(body["routed"], "local")
 
-    def test_get_wrong_token_403(self):
-        status, body = run_get("/send?token=nope&text=几点")
+    def test_get_wrong_header_token_403(self):
+        status, body = run_get("/send?text=几点", headers={"X-Voice-Token": "wrong"})
         self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+    def test_get_query_credentials_rejected_before_auth(self):
+        paths = (
+            "/send?token=placeholder&text=几点",
+            "/send?pin=placeholder&text=几点",
+            "/send?ToKeN=&text=几点",
+            "/send?PiN=&text=几点",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                status, body = run_get(path)
+                self.assertEqual(status, 400)
+                self.assertFalse(body["ok"])
+                self.assertIn("查询参数禁止携带凭据", body["error"])
 
     def test_empty_text_400(self):
         status, body = run_post("/send", "text=   ",
@@ -288,6 +325,22 @@ class SendEndpointTest(unittest.TestCase):
         status, body = run_post("/send", "text=" + "x" * 2001,
                                 headers={"X-Voice-Token": voice_server.TOKEN})
         self.assertEqual(status, 413)
+
+    def test_status_work_instruction_is_forwarded_to_voice_session(self):
+        text = "请把项目状态更新为完成"
+        delivered = {
+            "ok": True,
+            "sessionId": "synthetic-session",
+            "sessionSource": "newest-running",
+            "pending": True,
+            "requestId": "synthetic-request",
+        }
+        with mock.patch.object(voice_server, "send_text", return_value=delivered) as send:
+            status, body = run_post("/send", "text=" + urllib.parse.quote(text),
+                                    headers={"X-Voice-Token": voice_server.TOKEN})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["routed"], "voice-session")
+        send.assert_called_once_with("【语音】" + text, requested_id=None)
 
     def test_inbox_route_fake_success_returns_502(self):
         """审计修复①端点级:投递失败 → 502,绝不 200 假成功。"""

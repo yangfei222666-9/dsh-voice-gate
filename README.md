@@ -1,17 +1,17 @@
 # dsh-voice-gate 🐳
 
 > **痛点**:手机想给 DSH 发消息,打字麻烦、还要切网页。
-> **解法**:语音门——按住说话→转文字→一条 `/send` 直达会话;本地运行、零云中转;时间/备份/股价等意图本地即答。
-> **证据**:44 个测试(39 offline + 5 真实 E2E)全绿,CI 五矩阵,awesome-dsh 已收录,最新 tag v0.4.2。
+> **解法**:语音门——按住说话→转文字→一条 `/send` 直达会话;本地文本桥接;时间/备份/股价等意图本地即答。
+> **验证入口**:[离线测试](tests/test_voice_server.py)与 Python 3.9–3.13 CI；真实 DSH E2E 另行启用，见 [Development](#development)。
 
-A **voice gate** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): speak a note on your phone, tap send, and it lands in your DSH session — locally, with no cloud relay.
+A **voice gate** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): speak a note on your phone, tap send, and it lands in your DSH session — through a locally running text gateway.
 
 - 🎤 Mobile PWA page: hold-to-talk input (browser Web Speech API), text fallback, dark UI, whale icon
 - 🔌 Zero third-party dependencies: Python standard library + a single-file front end
 - 🔒 Token authentication (auto-generated, `0600`), path-traversal guard, 2000-char length cap
 - 🧭 **Intent routing**: local answers (time/date, backup sentinel status, stock quotes) without touching a session; everything else is delivered to your DSH inbox
 - 🔀 **`/api/*` reverse proxy** to your DSH web instance, so the bundled page works out of the box
-- 🛰️ LAN out of the box; Tailscale (or any HTTPS reverse proxy) for remote use
+- 🛰️ Loopback by default; phone access through Tailscale Serve or an equivalent private HTTPS reverse proxy
 - 🐳 Installable PWA with a whale icon (add to iPhone home screen)
 
 中文说明见 [README.zh-CN.md](README.zh-CN.md)。
@@ -25,11 +25,11 @@ A **voice gate** for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-
 
 ```
 Phone browser (Web Speech API → text)
-  │  HTTPS via Tailscale serve, or HTTP on LAN
+  │  HTTPS via Tailscale Serve → loopback backend
   ▼
 voice_server.py  (Python stdlib, http.server, port 3081, loopback; health :8899)
   │
-  ├─ GET/POST /send ── token check (X-Voice-Token header, GET query deprecated)
+  ├─ GET/POST /send ── token check (X-Voice-Token header; query credentials rejected)
   │      └─ intent router:
   │           ├─ time/date · backup sentinel · stock quotes → local answer (no DSH call)
   │           └─ everything else → session delivery:
@@ -46,16 +46,54 @@ Failure contract (v0.4 audit): an upstream `ok:false` is **always** surfaced as 
 
 ## Install
 
+Use Python 3.9+ on the DSH host. For phone access, connect the host and phone to the same Tailscale network, with access to this host allowed. Start DSH and create a session titled `手机语音门` (or your configured `VOICE_GATE_SESSION_TITLE`) before testing session delivery; a generic idle session is not selected by the running-session fallback.
+
 ```bash
-# 1. Clone
+# 1. Clone on the DSH host
 git clone https://github.com/yangfei222666-9/dsh-voice-gate
 cd dsh-voice-gate
 
-# 2. Run (first start auto-generates ~/.config/voice-gate.token, mode 0600)
-python3 voice_server.py
-# Defaults: listen 127.0.0.1:3081, health 0.0.0.0:8899, DSH API http://127.0.0.1:3080
+# 2. Create a one-use six-digit pairing PIN before starting the gateway.
+# This refuses to overwrite an existing PIN file. Keep the printed PIN private.
+python3 - <<'PIN_SETUP'
+import os, secrets
+from pathlib import Path
+pin_file = Path.home() / ".config" / "voice-gate.pin"
+pin_file.parent.mkdir(mode=0o700, exist_ok=True)
+pin = f"{secrets.randbelow(1_000_000):06d}"
+fd = os.open(pin_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(pin)
+print("One-use pairing PIN (keep private):", pin)
+PIN_SETUP
 
-# 3. Autostart (macOS launchd; adjust the path)
+# 3. Run and leave this terminal open.
+python3 voice_server.py
+# Defaults: listen 127.0.0.1:3081, health 127.0.0.1:8899, DSH API http://127.0.0.1:3080
+```
+
+The gateway creates its token on first start; it does **not** create a pairing PIN. If a PIN file already exists, use that PIN privately. A newly created PIN is loaded at startup; an already running gateway must be restarted to load it. Successful pairing consumes the PIN and removes its file.
+
+In a second terminal on the host, configure the private HTTPS route:
+
+```bash
+# 4. Inspect existing routes, then mount this gateway at /voice.
+tailscale serve status
+tailscale serve --bg --https=443 --set-path=/voice http://127.0.0.1:3081
+tailscale serve status
+```
+
+Keep an existing `/voice` route unless you intend to replace it. If prompted, follow Tailscale's HTTPS setup link. The command and prerequisites follow the official [Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve) and [Serve setup](https://tailscale.com/docs/features/tailscale-serve) documentation. `--bg` persists the route; this is a private tailnet route, not a public Funnel URL.
+
+5. On the phone with Tailscale connected, open the HTTPS host shown by `tailscale serve status`, with `/voice/` appended, for example `https://your-host.your-tailnet.ts.net/voice/`. Enter the one-use PIN in the page's pairing field. The page exchanges it in a `POST /voice/auth` body and sends later requests with `X-Voice-Token`; never put either credential in a URL. First type `现在几点` and send: a local answer checks pairing and the gateway without invoking DSH. Then send a short message intended for the existing DSH session and check its reply or explicit pending/error state. Only after text works, try the microphone and optionally add the page to the home screen.
+
+The default `127.0.0.1` listener cannot be reached directly at the computer's LAN IP. Keep that bind for this recipe; use the HTTPS `/voice/` URL on the phone. The bundled page sends requests to `/voice/*`, so the proxy route must include that prefix. If the page does not open, check both Tailscale connections, host access rules, the Serve route, and whether the gateway process is still running. A visible page alone does not prove DSH delivery.
+
+### Optional macOS autostart
+
+After the first connection works, stop the foreground gateway before enabling autostart to avoid two processes competing for port 3081. Replace the path below with your checkout path:
+
+```bash
 cat > ~/Library/LaunchAgents/com.you.voice-gate.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -67,11 +105,6 @@ cat > ~/Library/LaunchAgents/com.you.voice-gate.plist << 'EOF'
 </dict></plist>
 EOF
 launchctl load ~/Library/LaunchAgents/com.you.voice-gate.plist
-
-# 4. (Optional, for remote use) Tailscale HTTPS proxy
-tailscale serve --bg --set-path /voice http://127.0.0.1:3081
-
-# 5. Phone: Safari → http://<computer-IP>:3081/ → Share → Add to Home Screen
 ```
 
 ## Configuration
@@ -85,7 +118,7 @@ All configuration is environment-driven; nothing is hard-coded to a specific mac
 | Static root | `VOICE_GATE_ROOT` | `<repo>/www` | Page + `latest-reply.txt` |
 | Health port | `VOICE_HEALTH_PORT` | `8899` | `GET /` → `{"ok":true,"svc":"voice-gate-health"}` |
 | Token | — | `~/.config/voice-gate.token` | Auto-generated `secrets.token_hex(16)`, `0600` |
-| PIN (optional) | — | `~/.config/voice-gate.pin` | If the file exists, PIN is accepted as an alternative credential |
+| Pairing PIN | — | `~/.config/voice-gate.pin` | Load before startup; one-use PIN exchanged via `POST /auth` body, then consumed; not a request-auth alternative |
 | Voice session | `VOICE_GATE_SESSION_FILE` / `VOICE_GATE_SESSION_TITLE` / `VOICE_GATE_SESSION_PRESET` | `~/.config/voice-gate-session.json` / `手机语音门` / `standard` | Dedicated-session memory |
 | Backup sentinel (optional) | `VOICE_GATE_OPS_DIR`, `VOICE_GATE_BACKUP_SENTINELS` | unset | `OPS_DIR`=ops root (for `logs/receipts.jsonl` + `logs/backup-failures.jsonl`); `SENTINELS`=`pathA;pathB` — the two backup copies' tail hashes are compared against each other (never against the live copy, which necessarily grows after each backup) |
 | Stock quotes (optional) | `VOICE_GATE_PAPER_DIR`, `VOICE_GATE_STOCK_NAMES_JSON` | unset | `PAPER_DIR`=path to a [dsh-paper-trade](https://github.com/yangfei222666-9/dsh-paper-trade) checkout; `STOCK_NAMES_JSON`=path to a `{"名字": "SYM"}` map (self-configured; no personal watchlist is shipped) |
@@ -96,10 +129,11 @@ Unconfigured optional integrations degrade gracefully (e.g. "备份监控未配�
 
 ### `GET /send` · `POST /send`
 
-Auth: `X-Voice-Token: <token>` header (primary). `GET` query `token=`/`pin=` still works but logs a deprecation warning to stderr — migrate to the header.
+Auth: `X-Voice-Token: <token>` header. Any URL query containing `token` or `pin` (including empty or case-varied keys) is rejected with `400` before authentication, for both GET and POST. A pairing PIN is accepted only in the form body of `POST /auth`, which exchanges it once for a token; it cannot authenticate `/send` directly.
 
 | Case | Response |
 |---|---|
+| Credential in a URL query | `400` `{"ok": false}`; use the header or pairing body |
 | Bad or missing credentials | `403` `{"ok": false, "error": "token 无效"}` |
 | Empty text | `400` `{"ok": false, "error": "text 为空"}` |
 | Text longer than 2000 chars | `413` `{"ok": false, "error": "太长"}` |
@@ -110,9 +144,10 @@ Auth: `X-Voice-Token: <token>` header (primary). `GET` query `token=`/`pin=` sti
 
 ### Other endpoints
 
+- `POST /auth` — one-use PIN exchange; form body `pin=…`, invalid/consumed PIN → `403`, repeated failures may return `429`.
 - `GET /reply` — the latest reply text (the PWA polls this).
 - `GET/POST /api/*` — reverse proxy to the DSH web instance: status and body passed through, original headers forwarded (hop-by-hop headers stripped), 20s timeout, upstream unreachable → `502`.
-- `GET /` and other paths — static files from `www/`; `__VOICE_TOKEN__` in HTML is replaced with the real token at serve time and is never committed.
+- `GET /` and other paths — static files from `www/`; `__VOICE_TOKEN__` is populated only for an already authenticated request; a first browser visit receives an empty placeholder and uses PIN pairing.
 
 **Which session receives the note?** Selection order (each step falls through honestly): ① the `sessionId` you passed in the request → ② the saved dedicated voice session → ③ a session titled `手机语音门` (saved on first match) → ④ the newest *running* session by timestamp (multi-field fallback). The chosen source is reported in `sessionSource`; if no session matches, delivery fails explicitly — the gate never silently creates a session.
 
@@ -120,7 +155,7 @@ Auth: `X-Voice-Token: <token>` header (primary). `GET` query `token=`/`pin=` sti
 
 - Zero third-party dependencies (Python standard library only).
 - Loopback-only listener by default; remote access is expected to go through Tailscale serve (private HTTPS) or an equivalent reverse proxy.
-- Token auto-generated with `secrets.token_hex`, stored `0600` under `~/.config/`, injected into pages at serve time, never committed.
+- Token auto-generated with `secrets.token_hex`, stored `0600` under `~/.config/`, injected only into already authenticated page requests, never committed.
 - Path-traversal guard (`realpath` + `commonpath`) on static serving; 2000-char input cap.
 - Reply files (`latest-reply.txt`, session file) are written atomically (temp + `os.replace`) with `0600`/`0700` modes.
 
@@ -128,11 +163,11 @@ Auth: `X-Voice-Token: <token>` header (primary). `GET` query `token=`/`pin=` sti
 
 - `latest-reply.txt` holds the most recent reply only (last-write-wins per request id; older background waiters cannot overwrite a newer request's reply).
 - The whale icon referenced by the page (`whale-icon.png`) is not included in this snapshot yet.
-- GET-query auth is deprecated but still accepted for compatibility; it logs a warning on every use.
+- Old URL credentials are rejected. Pair in the page, then use the token header; an old bookmark containing `token=` or `pin=` must be replaced with the plain HTTPS `/voice/` URL.
 
 ## FAQ
 
-**Does it do speech recognition itself?** No. Speech-to-text happens on your phone (browser Web Speech API or keyboard dictation). The server only receives text. Where in-app Web Speech is unavailable, fall back to the page's text input with the phone keyboard's 🎤 dictation key.
+**Does it do speech recognition itself?** No. Use the HTTPS page in a browser that supports `SpeechRecognition`/`webkitSpeechRecognition`, allow microphone access, and start recognition with the page button. HTTPS alone does not guarantee API support; browser and standalone-PWA support vary. If recognition is unavailable or denied, type in the page or use the phone keyboard's 🎤 dictation key. The gateway receives text; browser recognition or keyboard dictation may use the device vendor's online service, so this project does not promise offline or fully on-device ASR. See [MDN SpeechRecognition](https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition).
 
 **What happens if DSH is not running?** Session delivery fails with `502`/`500` and an explicit error; nothing is queued or retried, and no fake success is ever returned. Local intents (time/backup/stock, when configured) keep working.
 
